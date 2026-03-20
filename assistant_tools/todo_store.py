@@ -8,7 +8,7 @@ Design goals:
 - lightweight CLI for manual/debug use
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,10 +19,9 @@ import uuid
 
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "assistant.sqlite3"
 
-
 PRIORITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "someday": 0}
 RISK_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
-STATUS_VALUES = {"open", "in_progress", "blocked", "done", "cancelled", "archived"}
+STATUS_VALUES = {"open", "in_progress", "waiting", "blocked", "done", "cancelled", "archived", "someday"}
 
 
 @dataclass
@@ -44,6 +43,8 @@ class TodoItem:
     estimate_minutes: int | None
     follow_up_at: str | None
     last_reviewed_at: str | None
+    next_action: str
+    blocked_by: list[str]
     created_at: str
     updated_at: str
     metadata: dict[str, Any]
@@ -83,6 +84,8 @@ class TodoStore:
                     estimate_minutes INTEGER,
                     follow_up_at TEXT,
                     last_reviewed_at TEXT,
+                    next_action TEXT NOT NULL DEFAULT '',
+                    blocked_by_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -95,6 +98,14 @@ class TodoStore:
                 CREATE INDEX IF NOT EXISTS idx_todo_category ON todo_items(category);
                 """
             )
+            self._ensure_column(conn, "todo_items", "next_action", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "todo_items", "blocked_by_json", "TEXT NOT NULL DEFAULT '[]'")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {row[1] for row in rows}
+        if column not in names:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -117,31 +128,39 @@ class TodoStore:
         energy: str = "normal",
         estimate_minutes: int | None = None,
         follow_up_at: str | None = None,
+        next_action: str = "",
+        blocked_by: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
         item_id = str(uuid.uuid4())
         now = self._now()
-        status = status if status in STATUS_VALUES else "open"
-        priority = priority if priority in PRIORITY_ORDER else "medium"
-        risk = risk if risk in RISK_ORDER else "unknown"
+        status = self._normalize_status(status)
+        priority = self._normalize_priority(priority)
+        risk = self._normalize_risk(risk)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO todo_items (
                     id, title, details, category, status, priority, risk, due_at, owner, source,
                     tags_json, project, actionable, energy, estimate_minutes, follow_up_at,
-                    last_reviewed_at, created_at, updated_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_reviewed_at, next_action, blocked_by_json, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id, title.strip(), details.strip(), category.strip() or "general", status,
                     priority, risk, due_at, owner, source, json.dumps(tags or [], ensure_ascii=False),
                     project.strip(), 1 if actionable else 0, energy.strip() or "normal",
-                    estimate_minutes, follow_up_at, None, now, now,
+                    estimate_minutes, follow_up_at, None, next_action.strip(),
+                    json.dumps(blocked_by or [], ensure_ascii=False), now, now,
                     json.dumps(metadata or {}, ensure_ascii=False),
                 ),
             )
         return item_id
+
+    def get_todo(self, item_id: str) -> TodoItem | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM todo_items WHERE id = ?", (item_id,)).fetchone()
+        return self._row_to_item(row) if row else None
 
     def list_todos(self, *, status: str | None = None, limit: int = 20) -> list[TodoItem]:
         query = (
@@ -163,24 +182,106 @@ class TodoStore:
             rows = conn.execute(
                 """
                 SELECT * FROM todo_items
-                WHERE title LIKE ? OR details LIKE ? OR project LIKE ? OR tags_json LIKE ? OR metadata_json LIKE ?
+                WHERE title LIKE ? OR details LIKE ? OR project LIKE ? OR tags_json LIKE ? OR metadata_json LIKE ? OR next_action LIKE ?
                 ORDER BY updated_at DESC LIMIT ?
                 """,
-                (pattern, pattern, pattern, pattern, pattern, int(limit)),
+                (pattern, pattern, pattern, pattern, pattern, pattern, int(limit)),
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
+
+    def update_todo(self, item_id: str, **fields: Any) -> TodoItem | None:
+        if not fields:
+            return self.get_todo(item_id)
+        allowed = {
+            "title", "details", "category", "status", "priority", "risk", "due_at", "owner", "source",
+            "project", "actionable", "energy", "estimate_minutes", "follow_up_at", "last_reviewed_at",
+            "next_action", "metadata", "tags", "blocked_by",
+        }
+        payload: dict[str, Any] = {}
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "status":
+                value = self._normalize_status(value)
+            elif key == "priority":
+                value = self._normalize_priority(value)
+            elif key == "risk":
+                value = self._normalize_risk(value)
+            elif key == "tags":
+                key = "tags_json"
+                value = json.dumps(value or [], ensure_ascii=False)
+            elif key == "blocked_by":
+                key = "blocked_by_json"
+                value = json.dumps(value or [], ensure_ascii=False)
+            elif key == "metadata":
+                key = "metadata_json"
+                value = json.dumps(value or {}, ensure_ascii=False)
+            elif key == "actionable":
+                value = 1 if bool(value) else 0
+            payload[key] = value
+        if not payload:
+            return self.get_todo(item_id)
+        payload["updated_at"] = self._now()
+        assignments = ", ".join(f"{k} = ?" for k in payload.keys())
+        values = list(payload.values()) + [item_id]
+        with self._connect() as conn:
+            conn.execute(f"UPDATE todo_items SET {assignments} WHERE id = ?", values)
+        return self.get_todo(item_id)
+
+    def set_status(self, item_id: str, status: str) -> TodoItem | None:
+        patch: dict[str, Any] = {"status": status}
+        normalized = self._normalize_status(status)
+        if normalized in {"done", "cancelled", "archived"}:
+            patch["last_reviewed_at"] = self._now()
+        return self.update_todo(item_id, **patch)
+
+    def reprioritize(self, item_id: str, *, priority: str | None = None, risk: str | None = None) -> TodoItem | None:
+        patch: dict[str, Any] = {}
+        if priority is not None:
+            patch["priority"] = priority
+        if risk is not None:
+            patch["risk"] = risk
+        return self.update_todo(item_id, **patch)
 
     def summarize_open(self, *, limit: int = 10) -> dict[str, Any]:
         items = self.list_todos(status="open", limit=limit)
         with self._connect() as conn:
-            counts = {
-                row[0]: row[1]
-                for row in conn.execute("SELECT status, COUNT(*) FROM todo_items GROUP BY status").fetchall()
-            }
+            counts = {row[0]: row[1] for row in conn.execute("SELECT status, COUNT(*) FROM todo_items GROUP BY status").fetchall()}
+        return {"counts": counts, "top_open": [self._item_to_dict(item) for item in items]}
+
+    def summarize_focus(self, *, limit: int = 10) -> dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM todo_items
+                WHERE status IN ('open','in_progress','blocked','waiting')
+                ORDER BY
+                    CASE priority WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                    CASE risk WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                    COALESCE(due_at, '9999-12-31T23:59:59+00:00') ASC,
+                    updated_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        items = [self._row_to_item(row) for row in rows]
         return {
-            "counts": counts,
-            "top_open": [self._item_to_dict(item) for item in items],
+            "focus": [self._item_to_dict(item) for item in items],
+            "high_priority": [self._item_to_dict(item) for item in items if item.priority in {"critical", "high"}],
+            "blocked": [self._item_to_dict(item) for item in items if item.status == "blocked"],
         }
+
+    def _normalize_status(self, value: Any) -> str:
+        text = str(value or "open").strip().lower()
+        return text if text in STATUS_VALUES else "open"
+
+    def _normalize_priority(self, value: Any) -> str:
+        text = str(value or "medium").strip().lower()
+        return text if text in PRIORITY_ORDER else "medium"
+
+    def _normalize_risk(self, value: Any) -> str:
+        text = str(value or "unknown").strip().lower()
+        return text if text in RISK_ORDER else "unknown"
 
     def _row_to_item(self, row: sqlite3.Row) -> TodoItem:
         return TodoItem(
@@ -201,23 +302,28 @@ class TodoStore:
             estimate_minutes=row["estimate_minutes"],
             follow_up_at=row["follow_up_at"],
             last_reviewed_at=row["last_reviewed_at"],
+            next_action=row["next_action"] if "next_action" in row.keys() else "",
+            blocked_by=json.loads(row["blocked_by_json"] or "[]") if "blocked_by_json" in row.keys() else [],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
     def _item_to_dict(self, item: TodoItem) -> dict[str, Any]:
+        payload = asdict(item)
         return {
-            "id": item.id,
-            "title": item.title,
-            "category": item.category,
-            "status": item.status,
-            "priority": item.priority,
-            "risk": item.risk,
-            "due_at": item.due_at,
-            "project": item.project,
-            "tags": item.tags,
-            "updated_at": item.updated_at,
+            "id": payload["id"],
+            "title": payload["title"],
+            "category": payload["category"],
+            "status": payload["status"],
+            "priority": payload["priority"],
+            "risk": payload["risk"],
+            "due_at": payload["due_at"],
+            "project": payload["project"],
+            "tags": payload["tags"],
+            "next_action": payload["next_action"],
+            "blocked_by": payload["blocked_by"],
+            "updated_at": payload["updated_at"],
         }
 
 
@@ -231,8 +337,12 @@ def _cli() -> None:
     add.add_argument("--category", default="general")
     add.add_argument("--priority", default="medium")
     add.add_argument("--risk", default="unknown")
+    add.add_argument("--status", default="open")
     add.add_argument("--project", default="")
     add.add_argument("--tags", default="")
+    add.add_argument("--next-action", default="")
+    add.add_argument("--blocked-by", default="")
+    add.add_argument("--due-at", default=None)
 
     ls = sub.add_parser("list")
     ls.add_argument("--status", default=None)
@@ -242,7 +352,28 @@ def _cli() -> None:
     search.add_argument("text")
     search.add_argument("--limit", type=int, default=20)
 
-    sub.add_parser("summary")
+    summary = sub.add_parser("summary")
+    summary.add_argument("--mode", choices=["open", "focus"], default="open")
+
+    get = sub.add_parser("get")
+    get.add_argument("id")
+
+    update = sub.add_parser("update")
+    update.add_argument("id")
+    update.add_argument("--title")
+    update.add_argument("--details")
+    update.add_argument("--category")
+    update.add_argument("--status")
+    update.add_argument("--priority")
+    update.add_argument("--risk")
+    update.add_argument("--project")
+    update.add_argument("--next-action")
+    update.add_argument("--blocked-by")
+    update.add_argument("--due-at")
+
+    close = sub.add_parser("close")
+    close.add_argument("id")
+    close.add_argument("--status", default="done")
 
     args = parser.parse_args()
     store = TodoStore()
@@ -254,8 +385,12 @@ def _cli() -> None:
             category=args.category,
             priority=args.priority,
             risk=args.risk,
+            status=args.status,
             project=args.project,
             tags=[t for t in args.tags.split(",") if t],
+            next_action=args.next_action,
+            blocked_by=[t for t in args.blocked_by.split(",") if t],
+            due_at=args.due_at,
         )
         print(json.dumps({"id": item_id}, ensure_ascii=False))
     elif args.cmd == "list":
@@ -263,7 +398,33 @@ def _cli() -> None:
     elif args.cmd == "search":
         print(json.dumps([store._item_to_dict(i) for i in store.search_todos(args.text, limit=args.limit)], ensure_ascii=False, indent=2))
     elif args.cmd == "summary":
-        print(json.dumps(store.summarize_open(), ensure_ascii=False, indent=2))
+        data = store.summarize_open() if args.mode == "open" else store.summarize_focus()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    elif args.cmd == "get":
+        item = store.get_todo(args.id)
+        print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
+    elif args.cmd == "update":
+        patch = {}
+        for field_name, value in {
+            "title": args.title,
+            "details": args.details,
+            "category": args.category,
+            "status": args.status,
+            "priority": args.priority,
+            "risk": args.risk,
+            "project": args.project,
+            "next_action": args.next_action,
+            "due_at": args.due_at,
+        }.items():
+            if value is not None:
+                patch[field_name] = value
+        if args.blocked_by is not None:
+            patch["blocked_by"] = [t for t in args.blocked_by.split(",") if t] if args.blocked_by else []
+        item = store.update_todo(args.id, **patch)
+        print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
+    elif args.cmd == "close":
+        item = store.set_status(args.id, args.status)
+        print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
