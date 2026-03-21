@@ -2,16 +2,18 @@ from __future__ import annotations
 
 """iCloud CalDAV sync bootstrap for Ocean assistant.
 
-Phase 1 goals:
+Current goals:
 - read open tasks from TodoStore
 - map tasks into Calendar/Reminder payloads
 - maintain local sync mapping table
-- support dry-run now, real CalDAV later
+- support dry-run now and real Calendar sync when credentials + deps are ready
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 import argparse
 import json
 import sys
@@ -61,6 +63,19 @@ class SyncConfig:
             reminder_minutes_before=int(payload.get("reminder_minutes_before", 10) or 10),
             mode=str(payload.get("mode", "dry-run") or "dry-run").strip(),
         )
+
+    def validate(self) -> list[str]:
+        issues: list[str] = []
+        if self.mode not in {"dry-run", "real"}:
+            issues.append("mode 只能是 dry-run 或 real")
+        if self.mode == "real":
+            if not self.icloud_url:
+                issues.append("缺少 icloud_url")
+            if not self.username:
+                issues.append("缺少 username")
+            if not self.app_specific_password:
+                issues.append("缺少 app_specific_password")
+        return issues
 
 
 def build_notes(item: TodoItem) -> str:
@@ -117,11 +132,82 @@ class DryRunSyncAdapter:
         return f"dryrun-reminder-{payload['task_id']}"
 
 
+class RealCalendarSyncAdapter:
+    def __init__(self, config: SyncConfig) -> None:
+        self.config = config
+        try:
+            import caldav  # type: ignore
+            from icalendar import Alarm, Calendar, Event  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "真实 iCloud Calendar 同步依赖缺失，请先安装 caldav 和 icalendar"
+            ) from exc
+        self._caldav = caldav
+        self._Calendar = Calendar
+        self._Event = Event
+        self._Alarm = Alarm
+        self._calendar_resource = None
+
+    def _get_calendar(self):
+        if self._calendar_resource is not None:
+            return self._calendar_resource
+        client = self._caldav.DAVClient(
+            url=self.config.icloud_url,
+            username=self.config.username,
+            password=self.config.app_specific_password,
+        )
+        principal = client.principal()
+        calendars = principal.calendars()
+        for calendar in calendars:
+            name = str(getattr(calendar, "name", "") or "").strip()
+            if name == self.config.calendar_name:
+                self._calendar_resource = calendar
+                return calendar
+        self._calendar_resource = principal.make_calendar(name=self.config.calendar_name)
+        return self._calendar_resource
+
+    def upsert_calendar_event(self, payload: dict[str, Any]) -> str:
+        calendar = self._get_calendar()
+        start_at = datetime.fromisoformat(str(payload["start_at"]))
+        end_at = start_at + timedelta(minutes=30)
+
+        cal = self._Calendar()
+        cal.add("prodid", "-//Ocean Assistant//iCloud Sync//CN")
+        cal.add("version", "2.0")
+
+        event = self._Event()
+        uid = f"ocean-assistant-calendar-{payload['task_id']}"
+        event.add("uid", uid)
+        event.add("summary", payload["title"])
+        event.add("dtstart", start_at)
+        event.add("dtend", end_at)
+        event.add("description", payload.get("notes", ""))
+
+        minutes_before = int(payload.get("alarm_minutes_before") or 10)
+        alarm = self._Alarm()
+        alarm.add("action", "DISPLAY")
+        alarm.add("description", payload["title"])
+        alarm.add("trigger", timedelta(minutes=-minutes_before))
+        event.add_component(alarm)
+        cal.add_component(event)
+
+        event_path = f"{uid}-{uuid4().hex}.ics"
+        saved = calendar.save_event(event_path, cal.to_ical())
+        url = getattr(saved, "url", None)
+        return str(url or event_path)
+
+    def upsert_reminder(self, payload: dict[str, Any]) -> str:
+        raise NotImplementedError("Reminders 真实同步下一步再接")
+
+
 class ICloudSyncService:
     def __init__(self, store: TodoStore, config: SyncConfig) -> None:
         self.store = store
         self.config = config
-        self.adapter = DryRunSyncAdapter()
+        if config.mode == "real":
+            self.adapter = RealCalendarSyncAdapter(config)
+        else:
+            self.adapter = DryRunSyncAdapter()
 
     def sync_open_tasks(self) -> dict[str, Any]:
         tasks = self.store.list_todos(status="open", limit=500)
@@ -132,18 +218,22 @@ class ICloudSyncService:
             "reminders_synced": 0,
             "calendar_payloads": [],
             "reminder_payloads": [],
+            "warnings": [],
         }
         for item in tasks:
             reminder_payload = map_task_to_reminder(item, self.config)
-            reminder_external_id = self.adapter.upsert_reminder(reminder_payload)
-            self.store.upsert_sync_binding(
-                task_id=item.id,
-                target_kind="reminder",
-                external_id=reminder_external_id,
-                external_key=str(reminder_payload["external_key"]),
-                payload=reminder_payload,
-            )
-            summary["reminders_synced"] += 1
+            try:
+                reminder_external_id = self.adapter.upsert_reminder(reminder_payload)
+                self.store.upsert_sync_binding(
+                    task_id=item.id,
+                    target_kind="reminder",
+                    external_id=reminder_external_id,
+                    external_key=str(reminder_payload["external_key"]),
+                    payload=reminder_payload,
+                )
+                summary["reminders_synced"] += 1
+            except NotImplementedError:
+                summary["warnings"].append(f"提醒未同步（待实现）：{item.id}")
             summary["reminder_payloads"].append(reminder_payload)
 
             calendar_payload = map_task_to_calendar(item, self.config)
@@ -163,13 +253,21 @@ class ICloudSyncService:
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="iCloud CalDAV sync bootstrap")
-    parser.add_argument("command", choices=["dry-run-sync", "show-bindings"])
+    parser.add_argument("command", choices=["dry-run-sync", "sync", "show-bindings", "validate-config"])
     args = parser.parse_args()
 
     store = TodoStore(DB_PATH)
     config = SyncConfig.load(CONFIG_PATH)
 
-    if args.command == "dry-run-sync":
+    if args.command == "validate-config":
+        print(json.dumps({"issues": config.validate(), "mode": config.mode}, ensure_ascii=False, indent=2))
+    elif args.command in {"dry-run-sync", "sync"}:
+        if args.command == "dry-run-sync":
+            config.mode = "dry-run"
+        issues = config.validate()
+        if issues:
+            print(json.dumps({"ok": False, "issues": issues}, ensure_ascii=False, indent=2))
+            raise SystemExit(1)
         service = ICloudSyncService(store, config)
         print(json.dumps(service.sync_open_tasks(), ensure_ascii=False, indent=2))
     elif args.command == "show-bindings":
