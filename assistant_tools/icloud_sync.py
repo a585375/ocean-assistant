@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 import argparse
 import json
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,8 @@ class SyncConfig:
     username: str
     app_specific_password: str
     calendar_name: str
+    work_calendar_name: str
+    life_calendar_name: str
     reminders_list_name: str
     reminders_fallback_list_name: str
     reminder_minutes_before: int
@@ -51,6 +54,8 @@ class SyncConfig:
                 username="",
                 app_specific_password="",
                 calendar_name="Ocean Assistant",
+                work_calendar_name="Ocean Work",
+                life_calendar_name="Ocean Life",
                 reminders_list_name="Ocean Tasks",
                 reminders_fallback_list_name="Reminders ⚠️",
                 reminder_minutes_before=10,
@@ -65,6 +70,8 @@ class SyncConfig:
             username=str(payload.get("username", "") or "").strip(),
             app_specific_password=str(payload.get("app_specific_password", "") or "").strip(),
             calendar_name=str(payload.get("calendar_name", "Ocean Assistant") or "Ocean Assistant").strip(),
+            work_calendar_name=str(payload.get("work_calendar_name", "Ocean Work") or "Ocean Work").strip(),
+            life_calendar_name=str(payload.get("life_calendar_name", "Ocean Life") or "Ocean Life").strip(),
             reminders_list_name=str(payload.get("reminders_list_name", "Ocean Tasks") or "Ocean Tasks").strip(),
             reminders_fallback_list_name=str(payload.get("reminders_fallback_list_name", "Reminders ⚠️") or "Reminders ⚠️").strip(),
             reminder_minutes_before=int(payload.get("reminder_minutes_before", 10) or 10),
@@ -105,16 +112,33 @@ def build_notes(item: TodoItem) -> str:
     return "\n".join(lines)
 
 
+def slugify_calendar_name(name: str) -> str:
+    text = re.sub(r'[^a-zA-Z0-9]+', '-', (name or '').strip().lower()).strip('-')
+    return text or 'calendar'
+
+
+def resolve_calendar_bucket(item: TodoItem, config: SyncConfig) -> str:
+    project = (item.project or '').strip()
+    if project in {'AutoTrade', 'GameDev'}:
+        return config.work_calendar_name
+    if project in {'Family', 'Leo'}:
+        return config.life_calendar_name
+    return config.life_calendar_name
+
+
 def map_task_to_calendar(item: TodoItem, config: SyncConfig) -> dict[str, Any] | None:
-    if not item.due_at:
+    start_at = str(item.metadata.get("calendar_start_at", "") or "").strip() or item.due_at
+    end_at = str(item.metadata.get("calendar_end_at", "") or "").strip() or item.due_at
+    if not start_at:
         return None
     return {
         "kind": "calendar",
         "task_id": item.id,
         "external_key": f"calendar:{item.id}",
-        "calendar_name": config.calendar_name,
+        "calendar_name": resolve_calendar_bucket(item, config),
         "title": item.title,
-        "start_at": item.due_at,
+        "start_at": start_at,
+        "end_at": end_at,
         "alarm_minutes_before": config.reminder_minutes_before,
         "notes": build_notes(item),
     }
@@ -156,7 +180,7 @@ class RealCalendarSyncAdapter:
         self._Event = Event
         self._Alarm = Alarm
         self._Todo = Todo
-        self._calendar_resource = None
+        self._calendar_resources: dict[str, Any] = {}
         self._reminders_resource = None
         self._principal = None
 
@@ -171,9 +195,9 @@ class RealCalendarSyncAdapter:
         self._principal = client.principal()
         return self._principal
 
-    def _get_calendar(self):
-        if self._calendar_resource is not None:
-            return self._calendar_resource
+    def _get_calendar(self, calendar_name: str):
+        if calendar_name in self._calendar_resources:
+            return self._calendar_resources[calendar_name]
         principal = self._get_principal()
         calendars = principal.calendars()
         for calendar in calendars:
@@ -181,11 +205,12 @@ class RealCalendarSyncAdapter:
                 name = str(calendar.get_display_name() or "").strip()
             except Exception:
                 name = str(getattr(calendar, "name", "") or "").strip()
-            if name == self.config.calendar_name:
-                self._calendar_resource = calendar
+            if name == calendar_name:
+                self._calendar_resources[calendar_name] = calendar
                 return calendar
-        self._calendar_resource = principal.make_calendar(name=self.config.calendar_name)
-        return self._calendar_resource
+        calendar = principal.make_calendar(name=calendar_name)
+        self._calendar_resources[calendar_name] = calendar
+        return calendar
 
     def _find_collection_by_name(self, target_name: str):
         principal = self._get_principal()
@@ -211,16 +236,19 @@ class RealCalendarSyncAdapter:
         return self._reminders_resource
 
     def upsert_calendar_event(self, payload: dict[str, Any]) -> str:
-        calendar = self._get_calendar()
+        calendar = self._get_calendar(str(payload["calendar_name"]))
         start_at = datetime.fromisoformat(str(payload["start_at"]))
-        end_at = start_at + timedelta(minutes=30)
+        end_at = datetime.fromisoformat(str(payload.get("end_at") or payload["start_at"]))
+        if end_at <= start_at:
+            end_at = start_at + timedelta(minutes=30)
 
         cal = self._Calendar()
         cal.add("prodid", "-//Ocean Assistant//iCloud Sync//CN")
         cal.add("version", "2.0")
 
         event = self._Event()
-        uid = f"ocean-assistant-calendar-{payload['task_id']}"
+        calendar_slug = slugify_calendar_name(str(payload["calendar_name"]))
+        uid = f"ocean-assistant-calendar-{calendar_slug}-{payload['task_id']}"
         event.add("uid", uid)
         event.add("summary", payload["title"])
         event.add("dtstart", start_at)
