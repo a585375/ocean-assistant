@@ -162,18 +162,41 @@ class TodoStore:
             row = conn.execute("SELECT * FROM todo_items WHERE id = ?", (item_id,)).fetchone()
         return self._row_to_item(row) if row else None
 
-    def list_todos(self, *, status: str | None = None, limit: int = 20) -> list[TodoItem]:
+    def list_todos(
+        self,
+        *,
+        status: str | None = None,
+        project: str | None = None,
+        priority: str | None = None,
+        category: str | None = None,
+        limit: int = 20,
+    ) -> list[TodoItem]:
+        conditions = []
+        params: list[Any] = []
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status)
+        if project is not None:
+            conditions.append("project = ?")
+            params.append(project.strip())
+        if priority is not None:
+            conditions.append("priority = ?")
+            params.append(self._normalize_priority(priority))
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category.strip())
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         query = (
-            "SELECT * FROM todo_items "
-            "WHERE (? IS NULL OR status = ?) "
+            f"SELECT * FROM todo_items {where} "
             "ORDER BY "
             "CASE priority WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, "
             "CASE risk WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, "
             "COALESCE(due_at, '9999-12-31T23:59:59+00:00') ASC, "
             "updated_at DESC LIMIT ?"
         )
+        params.append(int(limit))
         with self._connect() as conn:
-            rows = conn.execute(query, (status, status, int(limit))).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [self._row_to_item(row) for row in rows]
 
     def search_todos(self, text: str, *, limit: int = 20) -> list[TodoItem]:
@@ -314,15 +337,21 @@ class TodoStore:
         return {
             "id": payload["id"],
             "title": payload["title"],
+            "details": payload["details"],
             "category": payload["category"],
             "status": payload["status"],
             "priority": payload["priority"],
             "risk": payload["risk"],
             "due_at": payload["due_at"],
+            "follow_up_at": payload["follow_up_at"],
             "project": payload["project"],
             "tags": payload["tags"],
+            "actionable": payload["actionable"],
+            "energy": payload["energy"],
+            "estimate_minutes": payload["estimate_minutes"],
             "next_action": payload["next_action"],
             "blocked_by": payload["blocked_by"],
+            "created_at": payload["created_at"],
             "updated_at": payload["updated_at"],
         }
 
@@ -346,6 +375,9 @@ def _cli() -> None:
 
     ls = sub.add_parser("list")
     ls.add_argument("--status", default=None)
+    ls.add_argument("--project", default=None)
+    ls.add_argument("--priority", default=None)
+    ls.add_argument("--category", default=None)
     ls.add_argument("--limit", type=int, default=20)
 
     search = sub.add_parser("search")
@@ -375,6 +407,10 @@ def _cli() -> None:
     close.add_argument("id")
     close.add_argument("--status", default="done")
 
+    set_status = sub.add_parser("set-status")
+    set_status.add_argument("id")
+    set_status.add_argument("status")
+
     args = parser.parse_args()
     store = TodoStore()
 
@@ -394,7 +430,7 @@ def _cli() -> None:
         )
         print(json.dumps({"id": item_id}, ensure_ascii=False))
     elif args.cmd == "list":
-        print(json.dumps([store._item_to_dict(i) for i in store.list_todos(status=args.status, limit=args.limit)], ensure_ascii=False, indent=2))
+        print(json.dumps([store._item_to_dict(i) for i in store.list_todos(status=args.status, project=args.project, priority=args.priority, category=args.category, limit=args.limit)], ensure_ascii=False, indent=2))
     elif args.cmd == "search":
         print(json.dumps([store._item_to_dict(i) for i in store.search_todos(args.text, limit=args.limit)], ensure_ascii=False, indent=2))
     elif args.cmd == "summary":
@@ -423,6 +459,9 @@ def _cli() -> None:
         item = store.update_todo(args.id, **patch)
         print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
     elif args.cmd == "close":
+        item = store.set_status(args.id, args.status)
+        print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
+    elif args.cmd == "set-status":
         item = store.set_status(args.id, args.status)
         print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
 
