@@ -34,6 +34,8 @@ iCloud CalDAV sync bootstrap.
 - dry-run sync implemented
 - task -> Calendar / Reminders mapping implemented
 - local sync bindings persisted in SQLite
+- real Calendar adapter scaffold implemented
+- real Reminders adapter scaffold implemented
 - real iCloud credentials / transport pending
 
 ### Example

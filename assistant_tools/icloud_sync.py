@@ -137,26 +137,31 @@ class RealCalendarSyncAdapter:
         self.config = config
         try:
             import caldav  # type: ignore
-            from icalendar import Alarm, Calendar, Event  # type: ignore
+            from icalendar import Alarm, Calendar, Event, Todo  # type: ignore
         except Exception as exc:
             raise RuntimeError(
-                "真实 iCloud Calendar 同步依赖缺失，请先安装 caldav 和 icalendar"
+                "真实 iCloud 同步依赖缺失，请先安装 caldav 和 icalendar"
             ) from exc
         self._caldav = caldav
         self._Calendar = Calendar
         self._Event = Event
         self._Alarm = Alarm
+        self._Todo = Todo
         self._calendar_resource = None
+        self._reminders_resource = None
 
-    def _get_calendar(self):
-        if self._calendar_resource is not None:
-            return self._calendar_resource
+    def _get_principal(self):
         client = self._caldav.DAVClient(
             url=self.config.icloud_url,
             username=self.config.username,
             password=self.config.app_specific_password,
         )
-        principal = client.principal()
+        return client.principal()
+
+    def _get_calendar(self):
+        if self._calendar_resource is not None:
+            return self._calendar_resource
+        principal = self._get_principal()
         calendars = principal.calendars()
         for calendar in calendars:
             name = str(getattr(calendar, "name", "") or "").strip()
@@ -165,6 +170,19 @@ class RealCalendarSyncAdapter:
                 return calendar
         self._calendar_resource = principal.make_calendar(name=self.config.calendar_name)
         return self._calendar_resource
+
+    def _get_reminders_collection(self):
+        if self._reminders_resource is not None:
+            return self._reminders_resource
+        principal = self._get_principal()
+        calendars = principal.calendars()
+        for calendar in calendars:
+            name = str(getattr(calendar, "name", "") or "").strip()
+            if name == self.config.reminders_list_name:
+                self._reminders_resource = calendar
+                return calendar
+        self._reminders_resource = principal.make_calendar(name=self.config.reminders_list_name)
+        return self._reminders_resource
 
     def upsert_calendar_event(self, payload: dict[str, Any]) -> str:
         calendar = self._get_calendar()
@@ -197,7 +215,30 @@ class RealCalendarSyncAdapter:
         return str(url or event_path)
 
     def upsert_reminder(self, payload: dict[str, Any]) -> str:
-        raise NotImplementedError("Reminders 真实同步下一步再接")
+        reminders = self._get_reminders_collection()
+
+        cal = self._Calendar()
+        cal.add("prodid", "-//Ocean Assistant//iCloud Sync//CN")
+        cal.add("version", "2.0")
+
+        todo = self._Todo()
+        uid = f"ocean-assistant-reminder-{payload['task_id']}"
+        todo.add("uid", uid)
+        todo.add("summary", payload["title"])
+        todo.add("description", payload.get("notes", ""))
+        if payload.get("due_at"):
+            todo.add("due", datetime.fromisoformat(str(payload["due_at"])))
+        cal.add_component(todo)
+
+        reminder_path = f"{uid}-{uuid4().hex}.ics"
+        try:
+            saved = reminders.save_todo(reminder_path, cal.to_ical())
+            url = getattr(saved, "url", None)
+            return str(url or reminder_path)
+        except AttributeError as exc:
+            raise NotImplementedError(
+                "当前 caldav 库可能不支持 save_todo；需实测兼容后决定最终实现"
+            ) from exc
 
 
 class ICloudSyncService:

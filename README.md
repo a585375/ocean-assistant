@@ -23,4 +23,4 @@ Ocean 的私人助理仓库。
 - 数据库文件默认忽略，不直接提交到 git。
 - 待办系统支持新增、查询、更新、关闭、改优先级、focus 摘要。
 - 字段支持 `next_action`、`blocked_by`、`metadata`，便于后续扩展。
-- iCloud 同步当前先完成了本地映射、dry-run 和同步绑定表。
+- iCloud 同步当前先完成了本地映射、dry-run、同步绑定表，以及 Calendar / Reminders 的真实适配器骨架。
