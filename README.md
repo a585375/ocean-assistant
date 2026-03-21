@@ -16,6 +16,7 @@ Ocean 的私人助理仓库。
 - `assistant_tools/icloud_sync.py`：iCloud CalDAV 同步第一版骨架
 - `memory/`：阶段性记忆与工作记录
 - `projects/`：项目 / 主题知识库
+- `scripts/`：环境初始化与验证脚本
 - `data/`：本地数据库（默认不入库）
 
 说明：
