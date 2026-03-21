@@ -22,6 +22,7 @@ DB_PATH = Path(__file__).resolve().parents[1] / "data" / "assistant.sqlite3"
 PRIORITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "someday": 0}
 RISK_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
 STATUS_VALUES = {"open", "in_progress", "waiting", "blocked", "done", "cancelled", "archived", "someday"}
+SYNC_TARGET_VALUES = {"calendar", "reminder"}
 
 
 @dataclass
@@ -96,6 +97,18 @@ class TodoStore:
                 CREATE INDEX IF NOT EXISTS idx_todo_due_at ON todo_items(due_at);
                 CREATE INDEX IF NOT EXISTS idx_todo_project ON todo_items(project);
                 CREATE INDEX IF NOT EXISTS idx_todo_category ON todo_items(category);
+                CREATE TABLE IF NOT EXISTS todo_sync_bindings (
+                    task_id TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    external_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    synced_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, target_kind)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sync_target_kind ON todo_sync_bindings(target_kind);
+                CREATE INDEX IF NOT EXISTS idx_sync_external_key ON todo_sync_bindings(external_key);
                 """
             )
             self._ensure_column(conn, "todo_items", "next_action", "TEXT NOT NULL DEFAULT ''")
@@ -266,6 +279,60 @@ class TodoStore:
             patch["risk"] = risk
         return self.update_todo(item_id, **patch)
 
+    def upsert_sync_binding(
+        self,
+        *,
+        task_id: str,
+        target_kind: str,
+        external_id: str,
+        external_key: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_target = str(target_kind or "").strip().lower()
+        if normalized_target not in SYNC_TARGET_VALUES:
+            raise ValueError(f"Unsupported sync target_kind: {target_kind}")
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO todo_sync_bindings (task_id, target_kind, external_id, external_key, payload_json, synced_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, target_kind) DO UPDATE SET
+                    external_id = excluded.external_id,
+                    external_key = excluded.external_key,
+                    payload_json = excluded.payload_json,
+                    synced_at = excluded.synced_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    normalized_target,
+                    str(external_id),
+                    str(external_key),
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_sync_bindings(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id, target_kind, external_id, external_key, payload_json, synced_at, updated_at FROM todo_sync_bindings ORDER BY updated_at DESC"
+            ).fetchall()
+        return [
+            {
+                "task_id": row["task_id"],
+                "target_kind": row["target_kind"],
+                "external_id": row["external_id"],
+                "external_key": row["external_key"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+                "synced_at": row["synced_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
     def summarize_open(self, *, limit: int = 10) -> dict[str, Any]:
         items = self.list_todos(status="open", limit=limit)
         with self._connect() as conn:
@@ -411,6 +478,8 @@ def _cli() -> None:
     set_status.add_argument("id")
     set_status.add_argument("status")
 
+    show_sync = sub.add_parser("show-sync")
+
     args = parser.parse_args()
     store = TodoStore()
 
@@ -464,6 +533,8 @@ def _cli() -> None:
     elif args.cmd == "set-status":
         item = store.set_status(args.id, args.status)
         print(json.dumps(asdict(item) if item else None, ensure_ascii=False, indent=2))
+    elif args.cmd == "show-sync":
+        print(json.dumps(store.list_sync_bindings(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

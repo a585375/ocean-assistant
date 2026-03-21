@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "mode": "dry-run",
+  "icloud_url": "https://caldav.icloud.com",
+  "username": "your_apple_id@example.com",
+  "app_specific_password": "xxxx-xxxx-xxxx-xxxx",
+  "calendar_name": "Ocean Assistant",
+  "reminders_list_name": "Ocean Tasks",
+  "reminder_minutes_before": 10
+}
