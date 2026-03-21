@@ -40,6 +40,8 @@ iCloud CalDAV sync bootstrap.
 
 ### Example
 ```bash
+python assistant_tools/icloud_sync.py validate-config
 python assistant_tools/icloud_sync.py dry-run-sync
+python assistant_tools/icloud_sync.py sync
 python assistant_tools/icloud_sync.py show-bindings
 ```
