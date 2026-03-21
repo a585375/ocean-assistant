@@ -6,5 +6,7 @@
   "app_specific_password": "xxxx-xxxx-xxxx-xxxx",
   "calendar_name": "Ocean Assistant",
   "reminders_list_name": "Ocean Tasks",
-  "reminder_minutes_before": 10
+  "reminder_minutes_before": 10,
+  "sync_calendar": true,
+  "sync_reminders": true
 }

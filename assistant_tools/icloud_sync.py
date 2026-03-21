@@ -38,6 +38,8 @@ class SyncConfig:
     reminders_list_name: str
     reminder_minutes_before: int
     mode: str
+    sync_calendar: bool
+    sync_reminders: bool
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "SyncConfig":
@@ -62,6 +64,8 @@ class SyncConfig:
             reminders_list_name=str(payload.get("reminders_list_name", "Ocean Tasks") or "Ocean Tasks").strip(),
             reminder_minutes_before=int(payload.get("reminder_minutes_before", 10) or 10),
             mode=str(payload.get("mode", "dry-run") or "dry-run").strip(),
+            sync_calendar=bool(payload.get("sync_calendar", True)),
+            sync_reminders=bool(payload.get("sync_reminders", True)),
         )
 
     def validate(self) -> list[str]:
@@ -149,14 +153,18 @@ class RealCalendarSyncAdapter:
         self._Todo = Todo
         self._calendar_resource = None
         self._reminders_resource = None
+        self._principal = None
 
     def _get_principal(self):
+        if self._principal is not None:
+            return self._principal
         client = self._caldav.DAVClient(
             url=self.config.icloud_url,
             username=self.config.username,
             password=self.config.app_specific_password,
         )
-        return client.principal()
+        self._principal = client.principal()
+        return self._principal
 
     def _get_calendar(self):
         if self._calendar_resource is not None:
@@ -164,7 +172,10 @@ class RealCalendarSyncAdapter:
         principal = self._get_principal()
         calendars = principal.calendars()
         for calendar in calendars:
-            name = str(getattr(calendar, "name", "") or "").strip()
+            try:
+                name = str(calendar.get_display_name() or "").strip()
+            except Exception:
+                name = str(getattr(calendar, "name", "") or "").strip()
             if name == self.config.calendar_name:
                 self._calendar_resource = calendar
                 return calendar
@@ -177,7 +188,10 @@ class RealCalendarSyncAdapter:
         principal = self._get_principal()
         calendars = principal.calendars()
         for calendar in calendars:
-            name = str(getattr(calendar, "name", "") or "").strip()
+            try:
+                name = str(calendar.get_display_name() or "").strip()
+            except Exception:
+                name = str(getattr(calendar, "name", "") or "").strip()
             if name == self.config.reminders_list_name:
                 self._reminders_resource = calendar
                 return calendar
@@ -209,10 +223,20 @@ class RealCalendarSyncAdapter:
         event.add_component(alarm)
         cal.add_component(event)
 
-        event_path = f"{uid}-{uuid4().hex}.ics"
-        saved = calendar.save_event(event_path, cal.to_ical())
-        url = getattr(saved, "url", None)
-        return str(url or event_path)
+        event_name = f"{uid}.ics"
+        base_url = str(getattr(calendar, "url", "")).rstrip("/")
+        if not base_url:
+            raise RuntimeError("未获取到 iCloud calendar URL")
+        event_url = f"{base_url}/{event_name}"
+        response = self._principal.client.put(
+            event_url,
+            cal.to_ical().decode("utf-8"),
+            headers={"Content-Type": "text/calendar; charset=utf-8"},
+        )
+        status = getattr(response, "status", None) or getattr(response, "status_code", None)
+        if status not in (200, 201, 204):
+            raise RuntimeError(f"Calendar PUT 失败，status={status}")
+        return event_url
 
     def upsert_reminder(self, payload: dict[str, Any]) -> str:
         reminders = self._get_reminders_collection()
@@ -260,35 +284,39 @@ class ICloudSyncService:
             "calendar_payloads": [],
             "reminder_payloads": [],
             "warnings": [],
+            "sync_calendar": self.config.sync_calendar,
+            "sync_reminders": self.config.sync_reminders,
         }
         for item in tasks:
-            reminder_payload = map_task_to_reminder(item, self.config)
-            try:
-                reminder_external_id = self.adapter.upsert_reminder(reminder_payload)
-                self.store.upsert_sync_binding(
-                    task_id=item.id,
-                    target_kind="reminder",
-                    external_id=reminder_external_id,
-                    external_key=str(reminder_payload["external_key"]),
-                    payload=reminder_payload,
-                )
-                summary["reminders_synced"] += 1
-            except NotImplementedError:
-                summary["warnings"].append(f"提醒未同步（待实现）：{item.id}")
-            summary["reminder_payloads"].append(reminder_payload)
+            if self.config.sync_reminders:
+                reminder_payload = map_task_to_reminder(item, self.config)
+                try:
+                    reminder_external_id = self.adapter.upsert_reminder(reminder_payload)
+                    self.store.upsert_sync_binding(
+                        task_id=item.id,
+                        target_kind="reminder",
+                        external_id=reminder_external_id,
+                        external_key=str(reminder_payload["external_key"]),
+                        payload=reminder_payload,
+                    )
+                    summary["reminders_synced"] += 1
+                except NotImplementedError:
+                    summary["warnings"].append(f"提醒未同步（待实现）：{item.id}")
+                summary["reminder_payloads"].append(reminder_payload)
 
-            calendar_payload = map_task_to_calendar(item, self.config)
-            if calendar_payload is not None:
-                calendar_external_id = self.adapter.upsert_calendar_event(calendar_payload)
-                self.store.upsert_sync_binding(
-                    task_id=item.id,
-                    target_kind="calendar",
-                    external_id=calendar_external_id,
-                    external_key=str(calendar_payload["external_key"]),
-                    payload=calendar_payload,
-                )
-                summary["calendar_synced"] += 1
-                summary["calendar_payloads"].append(calendar_payload)
+            if self.config.sync_calendar:
+                calendar_payload = map_task_to_calendar(item, self.config)
+                if calendar_payload is not None:
+                    calendar_external_id = self.adapter.upsert_calendar_event(calendar_payload)
+                    self.store.upsert_sync_binding(
+                        task_id=item.id,
+                        target_kind="calendar",
+                        external_id=calendar_external_id,
+                        external_key=str(calendar_payload["external_key"]),
+                        payload=calendar_payload,
+                    )
+                    summary["calendar_synced"] += 1
+                    summary["calendar_payloads"].append(calendar_payload)
         return summary
 
 

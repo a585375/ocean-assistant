@@ -20,6 +20,8 @@
 - `app_specific_password`：App 专用密码
 - `calendar_name`：建议 `Ocean Assistant`
 - `reminders_list_name`：建议 `Ocean Tasks`
+- `sync_calendar`：建议先设为 `true`
+- `sync_reminders`：若 Reminders 兼容性有问题，可先设为 `false`
 
 ## 环境依赖
 需要安装：
