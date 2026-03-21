@@ -36,6 +36,7 @@ class SyncConfig:
     app_specific_password: str
     calendar_name: str
     reminders_list_name: str
+    reminders_fallback_list_name: str
     reminder_minutes_before: int
     mode: str
     sync_calendar: bool
@@ -51,8 +52,11 @@ class SyncConfig:
                 app_specific_password="",
                 calendar_name="Ocean Assistant",
                 reminders_list_name="Ocean Tasks",
+                reminders_fallback_list_name="Reminders ⚠️",
                 reminder_minutes_before=10,
                 mode="dry-run",
+                sync_calendar=True,
+                sync_reminders=True,
             )
         payload = json.loads(path.read_text(encoding="utf-8") or "{}")
         return cls(
@@ -62,6 +66,7 @@ class SyncConfig:
             app_specific_password=str(payload.get("app_specific_password", "") or "").strip(),
             calendar_name=str(payload.get("calendar_name", "Ocean Assistant") or "Ocean Assistant").strip(),
             reminders_list_name=str(payload.get("reminders_list_name", "Ocean Tasks") or "Ocean Tasks").strip(),
+            reminders_fallback_list_name=str(payload.get("reminders_fallback_list_name", "Reminders ⚠️") or "Reminders ⚠️").strip(),
             reminder_minutes_before=int(payload.get("reminder_minutes_before", 10) or 10),
             mode=str(payload.get("mode", "dry-run") or "dry-run").strip(),
             sync_calendar=bool(payload.get("sync_calendar", True)),
@@ -182,9 +187,7 @@ class RealCalendarSyncAdapter:
         self._calendar_resource = principal.make_calendar(name=self.config.calendar_name)
         return self._calendar_resource
 
-    def _get_reminders_collection(self):
-        if self._reminders_resource is not None:
-            return self._reminders_resource
+    def _find_collection_by_name(self, target_name: str):
         principal = self._get_principal()
         calendars = principal.calendars()
         for calendar in calendars:
@@ -192,9 +195,18 @@ class RealCalendarSyncAdapter:
                 name = str(calendar.get_display_name() or "").strip()
             except Exception:
                 name = str(getattr(calendar, "name", "") or "").strip()
-            if name == self.config.reminders_list_name:
-                self._reminders_resource = calendar
+            if name == target_name:
                 return calendar
+        return None
+
+    def _get_reminders_collection(self):
+        if self._reminders_resource is not None:
+            return self._reminders_resource
+        collection = self._find_collection_by_name(self.config.reminders_list_name)
+        if collection is not None:
+            self._reminders_resource = collection
+            return collection
+        principal = self._get_principal()
         self._reminders_resource = principal.make_calendar(name=self.config.reminders_list_name)
         return self._reminders_resource
 
@@ -238,9 +250,7 @@ class RealCalendarSyncAdapter:
             raise RuntimeError(f"Calendar PUT 失败，status={status}")
         return event_url
 
-    def upsert_reminder(self, payload: dict[str, Any]) -> str:
-        reminders = self._get_reminders_collection()
-
+    def _put_reminder(self, reminders, payload: dict[str, Any]) -> str:
         cal = self._Calendar()
         cal.add("prodid", "-//Ocean Assistant//iCloud Sync//CN")
         cal.add("version", "2.0")
@@ -250,19 +260,39 @@ class RealCalendarSyncAdapter:
         todo.add("uid", uid)
         todo.add("summary", payload["title"])
         todo.add("description", payload.get("notes", ""))
+        todo.add("status", "NEEDS-ACTION")
         if payload.get("due_at"):
             todo.add("due", datetime.fromisoformat(str(payload["due_at"])))
         cal.add_component(todo)
 
-        reminder_path = f"{uid}-{uuid4().hex}.ics"
+        reminder_name = f"{uid}.ics"
+        base_url = str(getattr(reminders, "url", "")).rstrip("/")
+        if not base_url:
+            raise RuntimeError("未获取到 iCloud reminders collection URL")
+        reminder_url = f"{base_url}/{reminder_name}"
+        response = self._principal.client.put(
+            reminder_url,
+            cal.to_ical().decode("utf-8"),
+            headers={"Content-Type": "text/calendar; charset=utf-8"},
+        )
+        status = getattr(response, "status", None) or getattr(response, "status_code", None)
+        if status not in (200, 201, 204):
+            raise RuntimeError(f"Reminder PUT 失败，status={status}")
+        return reminder_url
+
+    def upsert_reminder(self, payload: dict[str, Any]) -> str:
+        reminders = self._get_reminders_collection()
         try:
-            saved = reminders.save_todo(reminder_path, cal.to_ical())
-            url = getattr(saved, "url", None)
-            return str(url or reminder_path)
-        except AttributeError as exc:
-            raise NotImplementedError(
-                "当前 caldav 库可能不支持 save_todo；需实测兼容后决定最终实现"
-            ) from exc
+            return self._put_reminder(reminders, payload)
+        except Exception:
+            fallback_name = str(self.config.reminders_fallback_list_name or "").strip()
+            if not fallback_name or fallback_name == self.config.reminders_list_name:
+                raise
+            fallback = self._find_collection_by_name(fallback_name)
+            if fallback is None:
+                raise
+            payload["list_name"] = fallback_name
+            return self._put_reminder(fallback, payload)
 
 
 class ICloudSyncService:
@@ -323,10 +353,11 @@ class ICloudSyncService:
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="iCloud CalDAV sync bootstrap")
     parser.add_argument("command", choices=["dry-run-sync", "sync", "show-bindings", "validate-config"])
+    parser.add_argument("--config", default=str(CONFIG_PATH))
     args = parser.parse_args()
 
     store = TodoStore(DB_PATH)
-    config = SyncConfig.load(CONFIG_PATH)
+    config = SyncConfig.load(Path(args.config))
 
     if args.command == "validate-config":
         print(json.dumps({"issues": config.validate(), "mode": config.mode}, ensure_ascii=False, indent=2))
