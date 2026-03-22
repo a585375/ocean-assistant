@@ -36,6 +36,7 @@ class SyncConfig:
     username: str
     app_specific_password: str
     calendar_name: str
+    trading_calendar_name: str
     work_calendar_name: str
     life_calendar_name: str
     reminders_list_name: str
@@ -54,6 +55,7 @@ class SyncConfig:
                 username="",
                 app_specific_password="",
                 calendar_name="Ocean Assistant",
+                trading_calendar_name="Ocean Trading",
                 work_calendar_name="Ocean Work",
                 life_calendar_name="Ocean Life",
                 reminders_list_name="Ocean Tasks",
@@ -70,6 +72,7 @@ class SyncConfig:
             username=str(payload.get("username", "") or "").strip(),
             app_specific_password=str(payload.get("app_specific_password", "") or "").strip(),
             calendar_name=str(payload.get("calendar_name", "Ocean Assistant") or "Ocean Assistant").strip(),
+            trading_calendar_name=str(payload.get("trading_calendar_name", "Ocean Trading") or "Ocean Trading").strip(),
             work_calendar_name=str(payload.get("work_calendar_name", "Ocean Work") or "Ocean Work").strip(),
             life_calendar_name=str(payload.get("life_calendar_name", "Ocean Life") or "Ocean Life").strip(),
             reminders_list_name=str(payload.get("reminders_list_name", "Ocean Tasks") or "Ocean Tasks").strip(),
@@ -119,7 +122,9 @@ def slugify_calendar_name(name: str) -> str:
 
 def resolve_calendar_bucket(item: TodoItem, config: SyncConfig) -> str:
     project = (item.project or '').strip()
-    if project in {'AutoTrade', 'GameDev'}:
+    if project in {'AutoTrade'}:
+        return config.trading_calendar_name
+    if project in {'GameDev'}:
         return config.work_calendar_name
     if project in {'Family', 'Leo'}:
         return config.life_calendar_name
